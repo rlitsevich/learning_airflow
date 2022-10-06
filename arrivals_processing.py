@@ -16,30 +16,30 @@ def _process_dates(dag_run):
 
 
 def _process_arrivals(ti, dag_run):
-    arrivals = ti.xcom_pull(task_ids="extract_arrival")
+    arrivals = ti.xcom_pull(task_ids="extract_arrivals")
     df = pd.DataFrame(arrivals)
     df['rep_date'] = dag_run.execution_date.date()
-    df.to_csv('/tmp/processed_arrivals.csv', index=None, header=False)
+    df.to_csv(f'/tmp/processed_arrivals_{dag_run.execution_date.date()}.csv', index=None, header=False)
 
 
-def _store_arrivals():
-    hook = PostgresHook(postgres_conn_id='postgres')
+def _store_arrivals(dag_run):
+    hook = PostgresHook(postgres_conn_id='workdb_standalone')
     hook.copy_expert(sql="COPY arrivals FROM stdin WITH DELIMITER ',' NULL ''",
-                     filename='/tmp/processed_arrivals.csv')
+                     filename=f'/tmp/processed_arrivals_{dag_run.execution_date.date()}.csv')
 
 
-def _aggregate_arrivals():
-    hook = PostgresHook(postgres_conn_id='postgres')
+def _aggregate_arrivals(dag_run):
+    hook = PostgresHook(postgres_conn_id='workdb_standalone')
     df = hook.get_pandas_df(sql='select * from arrivals ')
 
-    ddf = df.groupby('rep_date')[['icao24']].count()
-    ddf.to_csv('/tmp/aggregated_arrivals.csv', index=None, header=False)
+    ddf = df.groupby('rep_date', as_index=False)[['icao24']].count()
+    ddf.to_csv(f'/tmp/aggregated_arrivals_{dag_run.execution_date.date()}.csv', index=None, header=False)
 
 
-def _store_aggregated_arrivals():
-    hook = PostgresHook(postgres_conn_id='postgres')
+def _store_aggregated_arrivals(dag_run):
+    hook = PostgresHook(postgres_conn_id='workdb_standalone')
     hook.copy_expert(sql="COPY rep_arrivals FROM stdin WITH DELIMITER ',' ",
-                     filename='/tmp/aggregated_arrivals.csv')
+                     filename=f'/tmp/aggregated_arrivals_{dag_run.execution_date.date()}.csv')
 
 
 with DAG('arrivals_processing', start_date=datetime(2022, 8, 1), schedule_interval='@daily', catchup=True,
@@ -48,7 +48,7 @@ with DAG('arrivals_processing', start_date=datetime(2022, 8, 1), schedule_interv
              "end_date": int(datetime.timestamp(datetime(2022, 8, 1, 23, 59, 59)))
          }) as dag:
     create_data_table = PostgresOperator(
-        postgres_conn_id='postgres',
+        postgres_conn_id='workdb_standalone',
         task_id='create_data_table',
         sql='''
         CREATE TABLE IF NOT EXISTS arrivals(
@@ -68,7 +68,7 @@ with DAG('arrivals_processing', start_date=datetime(2022, 8, 1), schedule_interv
     )
 
     create_agg_table = PostgresOperator(
-        postgres_conn_id='postgres',
+        postgres_conn_id='workdb_standalone',
         task_id='create_agg_table',
         sql='''
         CREATE TABLE IF NOT EXISTS rep_arrivals(
@@ -79,7 +79,7 @@ with DAG('arrivals_processing', start_date=datetime(2022, 8, 1), schedule_interv
     is_api_available = HttpSensor(
         task_id='is_api_available',
         http_conn_id='opensky_api',
-        endpoint='api/states/all'
+        endpoint=''
     )
 
     extract_arrivals = SimpleHttpOperator(
@@ -99,6 +99,12 @@ with DAG('arrivals_processing', start_date=datetime(2022, 8, 1), schedule_interv
         python_callable=_process_arrivals
     )
 
+    clear_arrivals = PostgresOperator(
+        task_id='clear_arrivals',
+        postgres_conn_id='workdb_standalone',
+        sql="DELETE FROM arrivals where rep_date= '{{ execution_date.date() }}';"
+    )
+
     store_arrivals = PythonOperator(
         task_id='store_arrivals',
         python_callable=_store_arrivals
@@ -111,7 +117,7 @@ with DAG('arrivals_processing', start_date=datetime(2022, 8, 1), schedule_interv
 
     truncate_agg_table = PostgresOperator(
         task_id='truncate_agg_table',
-        postgres_conn_id='postgres',
+        postgres_conn_id='workdb_standalone',
         sql="TRUNCATE TABLE rep_arrivals"
     )
 
@@ -126,5 +132,5 @@ with DAG('arrivals_processing', start_date=datetime(2022, 8, 1), schedule_interv
     )
 
     create_data_table >> create_agg_table >> is_api_available >> process_dates
-    process_dates >> extract_arrivals >> process_arrivals >> store_arrivals >> truncate_agg_table
+    process_dates >> clear_arrivals >> extract_arrivals >> process_arrivals >> store_arrivals >> truncate_agg_table
     truncate_agg_table >> aggregate_arrivals >> store_agg_arrivals
